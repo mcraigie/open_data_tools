@@ -262,76 +262,120 @@ def characterize_seasons(
 
 def name_seasons(char_df: pd.DataFrame) -> list[str]:
     """
-    Auto-generate distinctive names for each season based on what makes it
-    stand out relative to the other seasons (not absolute thresholds).
+    Name each season with one word by matching its full multivariate
+    climate fingerprint against word archetypes (like word vectors).
+
+    Each candidate word has an "ideal climate profile" — a vector of
+    signed weights across ALL dimensions (temp, rain, sun, wind,
+    humidity, solar, daylight, temp_range). A season's normalized
+    climate vector is compared to every word archetype via cosine
+    similarity, and we greedily assign the best unique match.
+
+    This way a word like "Scorching" doesn't just mean "hottest" —
+    it means hot + sunny + dry + high solar + long days, and the
+    match considers all of those together.
     """
-    names = []
     n = len(char_df)
 
-    # Rank each season on each dimension (0 = lowest, n-1 = highest)
-    def rank_col(col):
-        vals = char_df[col].values
-        order = np.argsort(np.argsort(vals))  # rank 0..n-1
-        return order
+    # ── Dimensions to use (column → short key) ──
+    dim_cols = [
+        ("mean_temp",         "temp"),
+        ("mean_rain_mm",      "rain"),
+        ("mean_sunshine_hrs", "sun"),
+        ("mean_wind_max",     "wind"),
+        ("mean_humidity",     "hum"),
+        ("mean_solar_mj",     "solar"),
+        ("mean_daylight_hrs", "daylen"),
+    ]
+    # Filter to available columns
+    dim_cols = [(col, key) for col, key in dim_cols
+                if col in char_df.columns and char_df[col].notna().all()]
+    dim_keys = [key for _, key in dim_cols]
 
-    temp_rank = rank_col("mean_temp") if "mean_temp" in char_df else np.zeros(n)
-    rain_rank = rank_col("mean_rain_mm") if "mean_rain_mm" in char_df else np.zeros(n)
-    sun_rank = rank_col("mean_sunshine_hrs") if "mean_sunshine_hrs" in char_df else np.zeros(n)
-    wind_rank = rank_col("mean_wind_max") if "mean_wind_max" in char_df else np.zeros(n)
-    humidity_rank = rank_col("mean_humidity") if "mean_humidity" in char_df else np.zeros(n)
+    # ── Normalize each season to z-scores across seasons ──
+    season_vecs = np.zeros((n, len(dim_cols)))
+    for di, (col, _) in enumerate(dim_cols):
+        vals = char_df[col].values.astype(float)
+        mu, sigma = vals.mean(), vals.std()
+        if sigma > 0:
+            season_vecs[:, di] = (vals - mu) / sigma
 
-    temp_labels = {0: "Coldest", 1: "Cold", n-2: "Warm", n-1: "Hottest"}
-    mid_temp = {i: ["Cool", "Mild", "Mild-Cool", "Mild-Warm"][i % 4] for i in range(2, n-2)}
-    temp_labels.update(mid_temp)
+    # ── Word archetypes: ideal z-score profiles ──
+    # Each word maps to {dim_key: weight}. Unlisted dims default to 0.
+    # Weights are conceptual z-scores: +1 = "above average for this word",
+    # -1 = "below average", magnitudes indicate importance.
+    WORD_ARCHETYPES = {
+        "Scorching": {"temp": 2,  "sun": 1,   "solar": 1.5, "rain": -1,  "hum": -1,  "daylen": 1},
+        "Bright":    {"sun": 2,   "solar": 1.5,"temp": 0.5, "rain": -0.5,"daylen": 1, "hum": -0.5},
+        "Radiant":   {"solar": 2, "sun": 1.5,  "daylen": 1.5,"temp": 0.5,"hum": -0.5},
+        "Balmy":     {"temp": 1,  "hum": 0.5,  "wind": -1,  "sun": 0.5,  "rain": -0.3},
+        "Crisp":     {"hum": -1.5,"temp": -0.5,"sun": 0.5,  "wind": 0.3, "rain": -0.5},
+        "Muggy":     {"hum": 2,   "temp": 0.8, "rain": 0.5, "wind": -0.5,"sun": -0.5},
+        "Drenched":  {"rain": 2,  "hum": 1,    "sun": -0.5, "wind": 0.5, "solar": -0.5},
+        "Parched":   {"rain": -2, "hum": -1,   "sun": 0.5,  "solar": 0.5,"temp": 0.3},
+        "Blustery":  {"wind": 2,  "rain": 0.5, "temp": -0.3,"sun": -0.3},
+        "Calm":      {"wind": -2, "rain": -0.3,"hum": 0.3},
+        "Grey":      {"sun": -2,  "solar": -1.5,"hum": 1,   "rain": 0.5, "daylen": -0.5},
+        "Frigid":    {"temp": -2, "hum": 0.5,  "sun": -1,   "solar": -1, "daylen": -1},
+        "Dim":       {"daylen": -2,"solar": -1.5,"sun": -1,  "temp": -1},
+        "Luminous":  {"daylen": 2, "solar": 1.5,"sun": 1,   "temp": 1},
+        "Gentle":    {"wind": -1, "rain": -0.5, "temp": 0,   "sun": 0,   "hum": 0},
+        "Sodden":    {"rain": 1.5,"hum": 1.5,   "sun": -1,  "wind": 0.3, "temp": -0.3},
+        "Stark":     {"temp": -1.5,"sun": -1.5, "solar": -1, "hum": 0.5, "rain": -0.5},
+        "Vivid":     {"sun": 1,   "temp": 0.5,  "rain": 0.5, "daylen": 0.5, "solar": 0.5},
+        "Mellow":    {"temp": 0.3, "wind": -1,  "rain": -0.3,"sun": 0.3, "hum": -0.3},
+        "Fierce":    {"wind": 1.5, "rain": 1,   "temp": -0.5,"sun": -0.5},
+        "Hazy":      {"hum": 1,   "sun": -0.5,  "wind": -0.5,"temp": 0.5, "solar": -0.3},
+        "Brisk":     {"wind": 1,  "temp": -0.5, "hum": -0.5, "sun": 0.3},
+        "Raw":       {"temp": -1, "wind": 1,    "rain": 0.5, "hum": 0.5, "sun": -1},
+        "Lush":      {"rain": 1,  "temp": 0.5,  "hum": 0.5,  "sun": 0.3, "daylen": 0.5},
+        "Bleak":     {"sun": -1.5,"temp": -1.5, "wind": 0.5, "daylen": -1,"solar": -1},
+        "Glowing":   {"solar": 1.5,"temp": 1,   "sun": 1,    "daylen": 0.5,"hum": -0.5},
+        "Sultry":    {"temp": 1.5, "hum": 1.5,  "wind": -1,  "rain": 0,  "sun": 0.3},
+    }
 
+    # ── Build archetype matrix ──
+    word_names = list(WORD_ARCHETYPES.keys())
+    word_vecs = np.zeros((len(word_names), len(dim_keys)))
+    for wi, word in enumerate(word_names):
+        archetype = WORD_ARCHETYPES[word]
+        for di, key in enumerate(dim_keys):
+            word_vecs[wi, di] = archetype.get(key, 0.0)
+
+    # ── Cosine similarity: season_vecs (n × d) vs word_vecs (w × d) ──
+    def cosine_sim(a, b):
+        dot = a @ b.T
+        norm_a = np.linalg.norm(a, axis=1, keepdims=True)
+        norm_b = np.linalg.norm(b, axis=1, keepdims=True)
+        norm_a[norm_a == 0] = 1
+        norm_b[norm_b == 0] = 1
+        return dot / (norm_a * norm_b.T)
+
+    sim_matrix = cosine_sim(season_vecs, word_vecs)  # shape (n, w)
+
+    # ── Greedy unique assignment (Hungarian-like but simple) ──
+    names = [None] * n
+    used = set()
+    for _ in range(n):
+        best_val = -999
+        best_si, best_wi = -1, -1
+        for si in range(n):
+            if names[si] is not None:
+                continue
+            for wi in range(len(word_names)):
+                if wi in used:
+                    continue
+                if sim_matrix[si, wi] > best_val:
+                    best_val = sim_matrix[si, wi]
+                    best_si, best_wi = si, wi
+        if best_si >= 0:
+            names[best_si] = word_names[best_wi]
+            used.add(best_wi)
+
+    # Fallback (shouldn't happen with 27 archetypes)
     for i in range(n):
-        parts = []
-        tr = int(temp_rank[i])
-
-        # Temperature - always include, use relative labels
-        if n <= 4:
-            t_names = {0: "Cold", 1: "Cool", 2: "Warm", 3: "Hot"}
-            parts.append(t_names.get(tr, "Mild"))
-        else:
-            parts.append(temp_labels.get(tr, "Mild"))
-
-        # Pick the most distinctive non-temperature feature
-        distinguishers = []
-        sr = int(sun_rank[i])
-        rr = int(rain_rank[i])
-        wr = int(wind_rank[i])
-        hr = int(humidity_rank[i])
-
-        if sr == n - 1:
-            distinguishers.append("Bright")
-        elif sr == 0:
-            distinguishers.append("Dark")
-        elif sr >= n - 2:
-            distinguishers.append("Sunny")
-        elif sr <= 1:
-            distinguishers.append("Grey")
-
-        if rr == n - 1:
-            distinguishers.append("Wettest")
-        elif rr == 0:
-            distinguishers.append("Driest")
-        elif rr >= n - 2:
-            distinguishers.append("Wet")
-
-        if wr >= n - 2:
-            distinguishers.append("Blustery")
-        elif wr == 0:
-            distinguishers.append("Calm")
-
-        if hr >= n - 2 and "Wet" not in str(distinguishers):
-            distinguishers.append("Humid")
-        elif hr == 0 and "Dry" not in str(distinguishers):
-            distinguishers.append("Crisp")
-
-        # Take up to 2 distinguishers
-        parts.extend(distinguishers[:2])
-
-        names.append(", ".join(parts))
+        if names[i] is None:
+            names[i] = f"Phase {i+1}"
 
     return names
 
